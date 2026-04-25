@@ -29,16 +29,14 @@ def main() -> None:
     )
 
     task_client = client.bind(task="minimal_demo")
-    task_client.log_event("minimal_script_started")
-    task_client.push_log("minimal_script_started")
+    task_client.log_event("minimal_script_started", push=True)
 
     with task_client.span("minimal.work"):
         started = time.perf_counter()
         time.sleep(0.05)
         elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
 
-    task_client.log_event("minimal_script_completed", elapsed_ms=elapsed_ms)
-    task_client.push_log("minimal_script_completed", elapsed_ms=elapsed_ms)
+    task_client.log_event("minimal_script_completed", elapsed_ms=elapsed_ms, push=True)
     client.close()
 
 

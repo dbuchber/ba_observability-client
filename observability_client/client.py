@@ -190,39 +190,28 @@ class BoundObservabilityClient:
         with self._client._bind_log_context(**self._context):
             yield
 
-    def log_event(self, message: str, level: str = "info", **fields: Any) -> None:
+    def log_event(
+        self,
+        message: str,
+        level: str = "info",
+        *,
+        push: bool = False,
+        raise_on_error: bool = False,
+        **fields: Any,
+    ) -> None:
         """Log a structured event with bound context applied.
 
         Args:
             message (str): Event message.
             level (str, optional): Log level token.
+            push (bool, optional): If ``True``, also push the event to Loki.
+            raise_on_error (bool, optional): When ``push=True``, controls whether
+                failed Loki delivery raises an exception.
             **fields (Any): Additional event fields.
         """
         with self._activate():
-            self._client.log_event(message, level=level, **fields)
-
-    def push_log(
-        self,
-        message: str,
-        level: str = "info",
-        *,
-        raise_on_error: bool = False,
-        **fields: object,
-    ) -> None:
-        """Push one structured event to Loki with bound context applied.
-
-        Args:
-            message (str): Event message.
-            level (str, optional): Log level token.
-            raise_on_error (bool, optional): Strict synchronous delivery toggle.
-            **fields (object): Additional event fields.
-        """
-        with self._activate():
-            self._client.push_log(
-                message,
-                level=level,
-                raise_on_error=raise_on_error,
-                **fields,
+            self._client.log_event(
+                message, level=level, push=push, raise_on_error=raise_on_error, **fields
             )
 
     @contextlib.contextmanager
@@ -337,7 +326,7 @@ class ObservabilityClient:
     Compatibility guarantees for current consumers:
 
     - Keep this class as the primary public API.
-    - Preserve existing methods (e.g. ``log_event``, ``push_log``,
+    - Preserve existing methods (e.g. ``log_event``,
       ``start_run``, ``span``, ``close``).
     - Keep helper constructors as additive convenience APIs.
     - Use profile presets as config defaults, not separate class trees.
@@ -1380,12 +1369,24 @@ class ObservabilityClient:
         """
         return self._run_id
 
-    def log_event(self, message: str, level: str = "info", **fields: Any) -> None:
-        """Log a structured JSON event to stdout.
+    def log_event(
+        self,
+        message: str,
+        level: str = "info",
+        *,
+        push: bool = False,
+        raise_on_error: bool = False,
+        **fields: Any,
+    ) -> None:
+        """Log a structured JSON event to stdout and optionally push to Loki.
 
         Args:
             message (str): Human-readable event message.
             level (str, optional): Log level (info, warning, error, debug).
+            push (bool, optional): If ``True``, also push the event to Loki.
+            raise_on_error (bool, optional): When ``push=True``, controls whether
+                failed Loki delivery raises an exception. Default is ``False``
+                (non-blocking, silent failure).
             **fields (Any): Additional structured fields.
         """
         payload_fields = self._merge_contextual_fields(fields)
@@ -1401,6 +1402,17 @@ class ObservabilityClient:
 
         method = getattr(self._logger, level.lower(), self._logger.info)
         method(message, extra={"ctx": payload})
+
+        if push:
+            if raise_on_error:
+                self._push_log_sync(
+                    message=message,
+                    level=level,
+                    fields=payload_fields,
+                    raise_on_error=True,
+                )
+            else:
+                self._enqueue_loki_event(message=message, level=level, fields=payload_fields)
 
     def log_sparql(
         self,
@@ -1431,46 +1443,6 @@ class ObservabilityClient:
             sparql_endpoint=sparql_endpoint,
             **fields,
         )
-
-    def push_log(
-        self,
-        message: str,
-        level: str = "info",
-        *,
-        raise_on_error: bool = False,
-        **fields: object,
-    ) -> None:
-        """Push one structured log event to Alloy's Loki Push API.
-
-        Default behavior is non-blocking: the event is enqueued for asynchronous
-        background delivery. This keeps request paths resilient under Loki
-        slowness and outages.
-
-        Callers can opt into strict synchronous behavior with
-        ``raise_on_error=True``.
-
-        Args:
-            message (str): Human-readable message text.
-            level (str, optional): Log level for label metadata.
-            raise_on_error (bool, optional): If ``True``, perform synchronous
-                delivery and raise on failures.
-            **fields (object): Additional JSON fields.
-
-        Raises:
-            RuntimeError: If strict mode is enabled and delivery fails.
-        """
-        merged_fields = self._merge_contextual_fields(dict(fields))
-
-        if raise_on_error:
-            self._push_log_sync(
-                message=message,
-                level=level,
-                fields=merged_fields,
-                raise_on_error=True,
-            )
-            return
-
-        self._enqueue_loki_event(message=message, level=level, fields=merged_fields)
 
     def log_metrics(self, metrics: dict[str, float]) -> None:
         """Log numeric metrics to MLflow when enabled.

@@ -36,8 +36,7 @@ def downstream(request: Request) -> dict[str, str]:
     """Handle the downstream request and emit correlated logs."""
     with client.fastapi_request_span(request=request, span_name="downstream.handle") as request_id:
         scoped = client.bind(request_id=request_id, component="downstream")
-        scoped.log_event("downstream_received")
-        scoped.push_log("downstream_received")
+        scoped.log_event("downstream_received", push=True)
         return {"status": "ok", "request_id": request_id}
 
 
@@ -56,8 +55,11 @@ def proxy(request: Request) -> dict[str, object]:
             )
 
         payload: dict[str, object] = response.json()
-        scoped.log_event("proxy_completed", status_code=response.status_code)
-        scoped.push_log("proxy_completed", status_code=response.status_code)
+        scoped.log_event(
+            "proxy_completed",
+            status_code=response.status_code,
+            push=True,
+        )
         return {
             "proxy_request_id": request_id,
             "downstream": payload,

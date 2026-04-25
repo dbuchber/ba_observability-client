@@ -203,8 +203,7 @@ class AgentB:
             scoped.log_event("agent_b_received_task", left=left, right=right)
             with scoped.span("tool.calculator.execute"):
                 result = calculator_tool(operation=operation, left=left, right=right)
-            scoped.log_event("agent_b_completed_task", result=result)
-            scoped.push_log("agent_b_completed_task", result=result)
+            scoped.log_event("agent_b_completed_task", result=result, push=True)
             return result
 
     @_mlflow_trace
@@ -307,11 +306,7 @@ class AgentA:
                 "agent_a_completed",
                 intermediate_result=intermediate,
                 final_result=final,
-            )
-            scoped.push_log(
-                "agent_a_completed",
-                intermediate_result=intermediate,
-                final_result=final,
+                push=True,
             )
             return {
                 "request_id": request_id,

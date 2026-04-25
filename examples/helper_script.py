@@ -24,7 +24,7 @@ def main() -> None:
         experiment_name="rag-kg-thesis",
     )
 
-    obs.push_log("helper_started", stage="startup")
+    obs.log_event("helper_started", stage="startup", push=True)
 
     obs.start_run(
         run_name="helper-script-run",
@@ -48,7 +48,7 @@ def main() -> None:
         obs.log_sparql(
             stage="sparql",
             query_hash=query_hash,
-            latency_ms=round(latency_ms, 2),
+            latency_ms=latency_ms,
             result_count=random.randint(1, 15),
             sparql_endpoint="http://fuseki:3030/ds/query",
             request_id=request_id,
@@ -62,17 +62,16 @@ def main() -> None:
             json.dump({"request_id": request_id, "latency_ms": latency_ms}, file, indent=2)
         obs.log_artifact(summary_path)
 
-        obs.log_event("helper_completed", stage="complete", request_id=request_id)
-        obs.push_log(
-            "process_done",
+        obs.log_event(
+            "helper_completed",
             stage="complete",
             request_id=request_id,
             latency_ms=round(latency_ms, 2),
             query_hash=query_hash,
+            push=True,
         )
     except Exception as exc:  # noqa: BLE001
-        obs.log_event("helper_failed", level="error", error=str(exc))
-        obs.push_log("helper_failed", level="error", error=str(exc))
+        obs.log_event("helper_failed", level="error", error=str(exc), push=True)
         raise
     finally:
         obs.close()
