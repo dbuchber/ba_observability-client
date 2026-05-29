@@ -14,6 +14,7 @@ env/
 # Runtime / project data 
 data/
 project_management/
+.claude/
 
 # Secrets / lokale Konfiguration
 .env

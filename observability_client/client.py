@@ -343,6 +343,7 @@ class ObservabilityClient:
     _LOKI_QUEUE_MAXSIZE = 2000
     _LOKI_REQUEST_TIMEOUT_SECONDS = 1.5
     _LOKI_DROP_WARNING_INTERVAL_SECONDS = 30.0
+    _LOKI_FAILURE_WARNING_INTERVAL_SECONDS = 30.0
     _LOKI_WORKER_IDLE_TIMEOUT_SECONDS = 0.2
     _LOKI_WORKER_JOIN_TIMEOUT_SECONDS = 1.0
     _DEFAULT_REQUEST_ID_HEADER = "x-request-id"
@@ -444,8 +445,11 @@ class ObservabilityClient:
         self._loki_worker_thread: threading.Thread | None = None
         self._loki_state_lock = threading.Lock()
         self._loki_dropped_events_count = 0
+        self._loki_delivery_failures_count = 0
         self._loki_last_drop_warning_monotonic = 0.0
+        self._loki_last_failure_warning_monotonic = 0.0
         self._loki_missing_endpoint_warned = False
+        self._closed = False
         self._start_loki_worker()
 
     @staticmethod
@@ -808,6 +812,12 @@ class ObservabilityClient:
     def _configure_tracer(self) -> trace.Tracer:
         """Configure OpenTelemetry tracing for this service.
 
+        ``trace.set_tracer_provider`` mutates a process-global. If a real
+        ``TracerProvider`` (SDK class) is already installed — by another
+        ``ObservabilityClient``, by ``opentelemetry-distro`` auto-init, or by
+        host code — reuse it instead of clobbering it. Only install a new
+        provider when none is set yet.
+
         Returns:
             trace.Tracer: Tracer instance.
 
@@ -818,6 +828,18 @@ class ObservabilityClient:
             raise RuntimeError(
                 "Tracing is enabled but OpenTelemetry dependencies are not installed."
             )
+
+        existing = trace.get_tracer_provider()
+        if isinstance(existing, TracerProvider):
+            self.log_event(
+                "tracer_provider_already_installed",
+                level="warning",
+                note=(
+                    "Reusing existing OpenTelemetry TracerProvider; "
+                    "this client did not install its own."
+                ),
+            )
+            return trace.get_tracer(self.settings.service_name)
 
         resource = Resource.create(
             {
@@ -1259,6 +1281,36 @@ class ObservabilityClient:
                 queue_maxsize=self._LOKI_QUEUE_MAXSIZE,
             )
 
+    def _record_delivery_failure(self) -> None:
+        """Record a failed Loki delivery and emit a throttled warning.
+
+        Mirrors the queue-overflow accounting: an in-memory counter plus a
+        rate-limited warning event so chronic Loki outages stay visible without
+        flooding stdout.
+        """
+        with self._loki_state_lock:
+            self._loki_delivery_failures_count += 1
+
+        should_warn = False
+        failure_count = 0
+        now = time.monotonic()
+
+        with self._loki_state_lock:
+            if (
+                now - self._loki_last_failure_warning_monotonic
+                >= self._LOKI_FAILURE_WARNING_INTERVAL_SECONDS
+            ):
+                self._loki_last_failure_warning_monotonic = now
+                should_warn = True
+                failure_count = self._loki_delivery_failures_count
+
+        if should_warn:
+            self.log_event(
+                "loki_delivery_failed",
+                level="warning",
+                failure_count=failure_count,
+            )
+
     def _enqueue_loki_event(self, message: str, level: str, fields: dict[str, object]) -> None:
         """Enqueue one Loki event for asynchronous background delivery.
 
@@ -1288,12 +1340,14 @@ class ObservabilityClient:
                 continue
 
             try:
-                self._push_log_sync(
+                delivered = self._push_log_sync(
                     message=item.message,
                     level=item.level,
                     fields=item.fields,
                     raise_on_error=False,
                 )
+                if not delivered:
+                    self._record_delivery_failure()
             finally:
                 self._loki_queue.task_done()
 
@@ -1404,12 +1458,15 @@ class ObservabilityClient:
         method(message, extra={"ctx": payload})
 
         if push:
-            if raise_on_error:
+            # After close() the background worker is stopped; deliver inline so
+            # late events (e.g. shutdown logs) are not silently lost to a queue
+            # nobody is draining.
+            if raise_on_error or self._closed:
                 self._push_log_sync(
                     message=message,
                     level=level,
                     fields=payload_fields,
-                    raise_on_error=True,
+                    raise_on_error=raise_on_error,
                 )
             else:
                 self._enqueue_loki_event(message=message, level=level, fields=payload_fields)
@@ -1493,7 +1550,16 @@ class ObservabilityClient:
             yield active_span
 
     def close(self) -> None:
-        """End the active MLflow run and emit a closing event."""
+        """End the active MLflow run and shut the background worker down.
+
+        Safe to call more than once; subsequent calls are no-ops. After close,
+        ``log_event(..., push=True)`` falls back to synchronous Loki delivery so
+        shutdown-time events still ship instead of vanishing into the stopped
+        worker's queue.
+        """
+        if self._closed:
+            return
+        self._closed = True
         self._stop_loki_worker()
         if self.settings.enable_mlflow and self._run_id:
             self.log_event("mlflow_run_closed", run_id=self._run_id)

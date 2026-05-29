@@ -11,7 +11,7 @@ This package is designed for:
 ## Features
 
 - Structured JSON logging (`log_event`, `log_sparql`)
-- Asynchronous Loki push delivery (`push_log`) with optional strict sync mode
+- Asynchronous Loki push delivery (`log_event(..., push=True)`) with optional strict sync mode
 - OpenTelemetry spans (`span`) and HTTP propagation helpers:
   - `fastapi_request_span` (inbound extraction)
   - `httpx_request` / `inject_trace_headers` (outbound injection)
@@ -61,10 +61,9 @@ client = ObservabilityClient.quick_script_mode(
 )
 
 scoped = client.bind(task="daily-job")
-scoped.log_event("job_started")
-scoped.push_log("job_started")
+scoped.log_event("job_started", push=True)
 
-scoped.log_event("job_finished", records=42)
+scoped.log_event("job_finished", records=42, push=True)
 client.close()
 ```
 
@@ -134,8 +133,7 @@ client.close()
 
 ```python
 scoped = client.bind(request_id="abc123", component="retriever")
-scoped.log_event("retrieve_started")
-scoped.push_log("retrieve_started")
+scoped.log_event("retrieve_started", push=True)
 ```
 
 Bound fields are merged into log payloads and reused by tracing helpers.
@@ -191,7 +189,7 @@ Default endpoint:
 
 - `http://localhost:9999/loki/api/v1/push`
 
-`push_log(...)` behavior:
+Push behavior (`log_event(..., push=True)`):
 
 - **Default:** asynchronous enqueue (non-blocking)
 - **Strict mode:** `raise_on_error=True` sends synchronously and raises on delivery failures
