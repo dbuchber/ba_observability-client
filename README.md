@@ -28,11 +28,12 @@ This package is designed for:
 
 Core dependencies (from `pyproject.toml`):
 
+- `httpx>=0.28.1`
 - `mlflow>=3.11.1`
 - `opentelemetry-distro>=0.62b1`
 - `opentelemetry-exporter-otlp>=1.41.1`
 
-Some examples use additional packages (`fastapi`, `httpx`, `prometheus-client`, `uvicorn`).
+Some examples use additional packages (`fastapi`, `prometheus-client`, `uvicorn`).
 
 ## Installation
 
@@ -191,8 +192,29 @@ Default endpoint:
 
 Push behavior (`log_event(..., push=True)`):
 
-- **Default:** asynchronous enqueue (non-blocking)
-- **Strict mode:** `raise_on_error=True` sends synchronously and raises on delivery failures
+- **Default:** asynchronous enqueue (non-blocking). A daemon worker drains a
+  bounded queue (capacity 2000) and POSTs to the Loki push endpoint.
+- **Strict mode:** `raise_on_error=True` sends synchronously and raises on
+  delivery failures.
+- **After `close()`:** the worker is stopped and subsequent
+  `log_event(..., push=True)` calls fall back to synchronous delivery so
+  shutdown-time events still ship instead of vanishing into the stopped queue.
+
+Diagnostic events emitted by the client itself (throttled to ~30s intervals so
+chronic problems stay visible without flooding stdout):
+
+- `loki_queue_full_dropping_events` — the async queue is full and events are
+  being dropped. Includes the running drop count.
+- `loki_delivery_failed` — the worker tried to deliver and the POST failed
+  (Loki unreachable, transport error, etc.). Includes the running failure
+  count.
+- `loki_push_endpoint_missing` — emitted once if no endpoint is configured.
+- `tracer_provider_already_installed` — another OpenTelemetry `TracerProvider`
+  was already installed (by another client, by `opentelemetry-distro`
+  auto-init, etc.); the client reuses it instead of clobbering the global.
+- `tracing_dependency_missing` — `enable_tracing=True` was requested but the
+  OpenTelemetry packages are not installed; structured logging continues
+  unaffected.
 
 Label guidance:
 
