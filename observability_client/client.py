@@ -39,17 +39,26 @@ try:
 except ImportError:  # pragma: no cover
     mlflow = None
 try:
-    from opentelemetry import propagate, trace
+    from opentelemetry import metrics, propagate, trace
+    from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    from opentelemetry.metrics import Observation
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
     _OTEL_AVAILABLE = True
 except ImportError:  # pragma: no cover
+    metrics = None
     propagate = None
     trace = None
+    OTLPMetricExporter = None
     OTLPSpanExporter = None
+    Observation = None
+    MeterProvider = None
+    PeriodicExportingMetricReader = None
     Resource = None
     TracerProvider = None
     BatchSpanProcessor = None
@@ -129,6 +138,10 @@ class ObservabilitySettings:
         enable_auto_instrumentation (bool): Whether OpenTelemetry
             auto-instrumentation (httpx outbound, FastAPI inbound) is activated
             when tracing is enabled. Defaults to follow ``enable_tracing``.
+        enable_metrics (bool): Whether OpenTelemetry metrics are enabled. A
+            ``MeterProvider`` is installed and self-metrics plus the
+            ``counter``/``histogram``/``up_down_counter`` API become active.
+            Defaults to follow ``enable_tracing``.
     """
 
     service_name: str
@@ -142,6 +155,7 @@ class ObservabilitySettings:
     enable_mlflow: bool
     enable_tracing: bool
     enable_auto_instrumentation: bool
+    enable_metrics: bool
 
 
 @dataclass(frozen=True)
@@ -382,6 +396,7 @@ class ObservabilityClient:
         enable_mlflow: bool | None = None,
         enable_tracing: bool | None = None,
         enable_auto_instrumentation: bool | None = None,
+        enable_metrics: bool | None = None,
     ) -> None:
         """Initialize the observability client.
 
@@ -413,6 +428,13 @@ class ObservabilityClient:
                 it follows the resolved ``enable_tracing`` value (on for
                 service/agent, off for script). Has no effect when tracing is
                 disabled or OpenTelemetry is unavailable.
+            enable_metrics (bool | None, optional): Explicit override for
+                OpenTelemetry metrics. If ``None``, it follows the resolved
+                ``enable_tracing`` value (on for service/agent, off for script).
+                When enabled, a ``MeterProvider`` is installed and the
+                ``counter``/``histogram``/``up_down_counter`` API plus client
+                self-metrics become active. No effect when OpenTelemetry is
+                unavailable.
 
         Raises:
             ValueError: If required values are empty or profile is invalid.
@@ -430,6 +452,9 @@ class ObservabilityClient:
             if enable_auto_instrumentation is None
             else enable_auto_instrumentation
         )
+        resolved_enable_metrics = (
+            resolved_enable_tracing if enable_metrics is None else enable_metrics
+        )
 
         self.settings = ObservabilitySettings(
             service_name=normalized_service_name,
@@ -446,6 +471,7 @@ class ObservabilityClient:
             enable_mlflow=resolved_enable_mlflow,
             enable_tracing=resolved_enable_tracing,
             enable_auto_instrumentation=resolved_enable_auto_instrumentation,
+            enable_metrics=resolved_enable_metrics,
         )
         if self.settings.enable_mlflow and mlflow is None:
             raise RuntimeError(
@@ -485,6 +511,24 @@ class ObservabilityClient:
         self._loki_last_drop_warning_monotonic = 0.0
         self._loki_last_failure_warning_monotonic = 0.0
         self._loki_missing_endpoint_warned = False
+        if self.settings.enable_metrics and not _OTEL_AVAILABLE:
+            self.log_event(
+                "metrics_dependency_missing",
+                level="warning",
+                note=(
+                    "OpenTelemetry packages are not installed. "
+                    "Metrics are disabled; structured logging continues."
+                ),
+            )
+        self._meter_provider = None
+        self._meter = (
+            self._configure_meter()
+            if self.settings.enable_metrics and _OTEL_AVAILABLE
+            else None
+        )
+        self._user_instruments: dict[tuple[str, str], Any] = {}
+        self._user_instruments_lock = threading.Lock()
+        self._init_metric_instruments()
         self._closed = False
         self._start_loki_worker()
 
@@ -619,6 +663,7 @@ class ObservabilityClient:
         enable_mlflow: bool | None = None,
         enable_tracing: bool | None = None,
         enable_auto_instrumentation: bool | None = None,
+        enable_metrics: bool | None = None,
     ) -> "ObservabilityClient":
         """Create a client from environment variables.
 
@@ -639,6 +684,9 @@ class ObservabilityClient:
             enable_auto_instrumentation (bool | None, optional): Override for
                 auto-instrumentation. Falls back to
                 ``OBSERVABILITY_AUTO_INSTRUMENTATION`` and then the resolved
+                tracing value.
+            enable_metrics (bool | None, optional): Override for metrics. Falls
+                back to ``OBSERVABILITY_ENABLE_METRICS`` and then the resolved
                 tracing value.
 
         Returns:
@@ -737,6 +785,15 @@ class ObservabilityClient:
                 )
             )
 
+        resolved_enable_metrics = enable_metrics
+        if resolved_enable_metrics is None:
+            resolved_enable_metrics = cls._parse_bool(
+                cls._first_non_empty(
+                    os.getenv("OBSERVABILITY_ENABLE_METRICS"),
+                    os.getenv("ENABLE_METRICS"),
+                )
+            )
+
         if resolved_service_name is None:
             raise ValueError(
                 "service_name is required. Pass service_name or set "
@@ -757,6 +814,7 @@ class ObservabilityClient:
             enable_mlflow=resolved_enable_mlflow,
             enable_tracing=resolved_enable_tracing,
             enable_auto_instrumentation=resolved_enable_auto_instrumentation,
+            enable_metrics=resolved_enable_metrics,
         )
 
     @classmethod
@@ -906,6 +964,120 @@ class ObservabilityClient:
         provider.add_span_processor(BatchSpanProcessor(exporter))
         trace.set_tracer_provider(provider)
         return trace.get_tracer(self.settings.service_name)
+
+    def _configure_meter(self) -> metrics.Meter:
+        """Configure OpenTelemetry metrics for this service.
+
+        Mirrors :meth:`_configure_tracer`. ``metrics.set_meter_provider``
+        mutates a process-global; if a real SDK ``MeterProvider`` is already
+        installed — by another ``ObservabilityClient``, by
+        ``opentelemetry-distro`` auto-init, or by host code — reuse it instead
+        of clobbering it. Only install a new provider when none is set yet, and
+        only then record it on ``self._meter_provider`` so :meth:`close` flushes
+        a provider this client actually owns.
+
+        Returns:
+            metrics.Meter: Meter instance bound to the active provider.
+
+        Raises:
+            RuntimeError: If OpenTelemetry dependencies are not installed.
+        """
+        if not _OTEL_AVAILABLE:
+            raise RuntimeError(
+                "Metrics are enabled but OpenTelemetry dependencies are not installed."
+            )
+
+        existing = metrics.get_meter_provider()
+        if isinstance(existing, MeterProvider):
+            self.log_event(
+                "meter_provider_already_installed",
+                level="warning",
+                note=(
+                    "Reusing existing OpenTelemetry MeterProvider; "
+                    "this client did not install its own."
+                ),
+            )
+            return metrics.get_meter(self.settings.service_name)
+
+        resource = Resource.create(
+            {
+                SERVICE_NAME: self.settings.service_name,
+                DEPLOYMENT_ENVIRONMENT: self.settings.env,
+                "deployment.environment.name": self.settings.env,
+            }
+        )
+        exporter = OTLPMetricExporter(
+            endpoint=f"{self.settings.otlp_endpoint.rstrip('/')}/v1/metrics"
+        )
+        reader = PeriodicExportingMetricReader(exporter)
+        provider = MeterProvider(resource=resource, metric_readers=[reader])
+        metrics.set_meter_provider(provider)
+        self._meter_provider = provider
+        return metrics.get_meter(self.settings.service_name)
+
+    def _init_metric_instruments(self) -> None:
+        """Create the client's own OpenTelemetry instruments once.
+
+        Installs self-metrics describing the health of the asynchronous Loki
+        delivery path plus inbound/outbound HTTP request duration histograms.
+        All instruments are left as ``None`` when metrics are disabled or
+        OpenTelemetry is unavailable, so the recording call sites stay guarded
+        and become silent no-ops.
+
+        The ``observability.loki.queue_depth`` gauge is observable: the
+        callback reads :attr:`_loki_queue` live, so this method must run after
+        the queue is created.
+        """
+        self._metric_loki_enqueued = None
+        self._metric_loki_dropped = None
+        self._metric_loki_failures = None
+        self._metric_http_server_duration = None
+        self._metric_http_client_duration = None
+        if not self._meter:
+            return
+
+        self._metric_loki_enqueued = self._meter.create_counter(
+            "observability.loki.events_enqueued",
+            unit="1",
+            description="Loki events accepted onto the async delivery queue.",
+        )
+        self._metric_loki_dropped = self._meter.create_counter(
+            "observability.loki.events_dropped",
+            unit="1",
+            description="Loki events dropped because the delivery queue was full.",
+        )
+        self._metric_loki_failures = self._meter.create_counter(
+            "observability.loki.delivery_failures",
+            unit="1",
+            description="Failed attempts to POST a batch to the Loki push endpoint.",
+        )
+        self._meter.create_observable_gauge(
+            "observability.loki.queue_depth",
+            callbacks=[self._observe_loki_queue_depth],
+            unit="1",
+            description="Current number of events buffered in the Loki delivery queue.",
+        )
+        self._metric_http_server_duration = self._meter.create_histogram(
+            "observability.http.server.duration",
+            unit="ms",
+            description="Inbound HTTP request duration handled via fastapi_request_span.",
+        )
+        self._metric_http_client_duration = self._meter.create_histogram(
+            "observability.http.client.duration",
+            unit="ms",
+            description="Outbound HTTP request duration handled via httpx_request.",
+        )
+
+    def _observe_loki_queue_depth(self, _options: Any) -> list[Any]:
+        """Report the live Loki queue depth for the observable gauge.
+
+        Args:
+            _options (Any): Callback options supplied by the SDK (unused).
+
+        Returns:
+            list[Any]: A single ``Observation`` with the current queue size.
+        """
+        return [Observation(self._loki_queue.qsize())]
 
     def _configure_auto_instrumentation(self) -> None:
         """Activate OpenTelemetry auto-instrumentation for outbound httpx calls.
@@ -1199,31 +1371,66 @@ class ObservabilityClient:
         if path:
             span_attributes.setdefault("http.route", str(path))
 
-        with self._bind_log_context(request_id=resolved_request_id):
-            if not self._tracer:
-                yield resolved_request_id
-                return
+        start_monotonic = time.monotonic()
+        try:
+            with self._bind_log_context(request_id=resolved_request_id):
+                if not self._tracer:
+                    yield resolved_request_id
+                    return
 
-            if self._fastapi_auto_instrumented:
-                # The FastAPI instrumentor already started the SERVER span and
-                # extracted W3C context. Don't open a duplicate; just enrich the
-                # active span with request_id and any extra attributes.
-                current_span = trace.get_current_span()
-                for key, value in span_attributes.items():
-                    if value is not None:
-                        current_span.set_attribute(key, value)
-                yield resolved_request_id
-                return
+                if self._fastapi_auto_instrumented:
+                    # The FastAPI instrumentor already started the SERVER span and
+                    # extracted W3C context. Don't open a duplicate; just enrich the
+                    # active span with request_id and any extra attributes.
+                    current_span = trace.get_current_span()
+                    for key, value in span_attributes.items():
+                        if value is not None:
+                            current_span.set_attribute(key, value)
+                    yield resolved_request_id
+                    return
 
-            with self._tracer.start_as_current_span(
-                span_name,
-                context=extracted_context,
-                kind=trace.SpanKind.SERVER,
-            ) as active_span:
-                for key, value in span_attributes.items():
-                    if value is not None:
-                        active_span.set_attribute(key, value)
-                yield resolved_request_id
+                with self._tracer.start_as_current_span(
+                    span_name,
+                    context=extracted_context,
+                    kind=trace.SpanKind.SERVER,
+                ) as active_span:
+                    for key, value in span_attributes.items():
+                        if value is not None:
+                            active_span.set_attribute(key, value)
+                    yield resolved_request_id
+        finally:
+            self._record_request_duration(
+                self._metric_http_server_duration,
+                start_monotonic,
+                {
+                    "http.method": span_attributes.get("http.method"),
+                    "http.route": span_attributes.get("http.route"),
+                },
+            )
+
+    def _record_request_duration(
+        self,
+        histogram: Any,
+        start_monotonic: float,
+        attributes: dict[str, Any],
+    ) -> None:
+        """Record an HTTP request duration on a histogram if metrics are active.
+
+        Silent no-op when ``histogram`` is ``None`` (metrics disabled). Attributes
+        with ``None`` values are dropped to keep metric label cardinality low.
+
+        Args:
+            histogram (Any): Target duration histogram, or ``None``.
+            start_monotonic (float): ``time.monotonic()`` value captured at start.
+            attributes (dict[str, Any]): Candidate metric attributes.
+        """
+        if not histogram:
+            return
+        duration_ms = (time.monotonic() - start_monotonic) * 1000.0
+        clean_attributes = {
+            key: value for key, value in attributes.items() if value is not None
+        }
+        histogram.record(duration_ms, clean_attributes)
 
     def inject_trace_headers(self, headers: dict[str, str] | None = None) -> dict[str, str]:
         """Return headers with W3C trace context injected from current context.
@@ -1278,25 +1485,35 @@ class ObservabilityClient:
         if bound_request_id and header_key.lower() not in normalized_keys:
             outgoing_headers[header_key] = str(bound_request_id)
 
-        if self._httpx_globally_instrumented():
-            # Whenever httpx is auto-instrumented in this process (by this
-            # client or anyone else), the instrumentor owns the CLIENT span and
-            # W3C propagation. Avoid a duplicate manual span; only forward the
-            # business request_id header set above.
-            return request_func(method, url, headers=outgoing_headers, **kwargs)
+        start_monotonic = time.monotonic()
+        try:
+            if self._httpx_globally_instrumented():
+                # Whenever httpx is auto-instrumented in this process (by this
+                # client or anyone else), the instrumentor owns the CLIENT span and
+                # W3C propagation. Avoid a duplicate manual span; only forward the
+                # business request_id header set above.
+                return request_func(method, url, headers=outgoing_headers, **kwargs)
 
-        if not self._tracer:
-            outgoing_headers = self.inject_trace_headers(outgoing_headers)
-            return request_func(method, url, headers=outgoing_headers, **kwargs)
+            if not self._tracer:
+                outgoing_headers = self.inject_trace_headers(outgoing_headers)
+                return request_func(method, url, headers=outgoing_headers, **kwargs)
 
-        with self._tracer.start_as_current_span(span_name, kind=trace.SpanKind.CLIENT) as active_span:
-            active_span.set_attribute("http.method", method)
-            active_span.set_attribute("http.url", url)
-            if bound_request_id:
-                active_span.set_attribute("request_id", str(bound_request_id))
+            with self._tracer.start_as_current_span(span_name, kind=trace.SpanKind.CLIENT) as active_span:
+                active_span.set_attribute("http.method", method)
+                active_span.set_attribute("http.url", url)
+                if bound_request_id:
+                    active_span.set_attribute("request_id", str(bound_request_id))
 
-            outgoing_headers = self.inject_trace_headers(outgoing_headers)
-            return request_func(method, url, headers=outgoing_headers, **kwargs)
+                outgoing_headers = self.inject_trace_headers(outgoing_headers)
+                return request_func(method, url, headers=outgoing_headers, **kwargs)
+        finally:
+            # Record only the low-cardinality method; the full URL stays a span
+            # attribute, not a metric label.
+            self._record_request_duration(
+                self._metric_http_client_duration,
+                start_monotonic,
+                {"http.method": method},
+            )
 
     def _build_loki_body(self, message: str, level: str, fields: dict[str, object]) -> dict[str, Any]:
         """Build a Loki push payload body from event fields.
@@ -1449,6 +1666,8 @@ class ObservabilityClient:
         """
         with self._loki_state_lock:
             self._loki_delivery_failures_count += 1
+        if self._metric_loki_failures:
+            self._metric_loki_failures.add(1)
 
         should_warn = False
         failure_count = 0
@@ -1482,9 +1701,13 @@ class ObservabilityClient:
             self._loki_queue.put_nowait(
                 _LokiQueueItem(message=message, level=level, fields=dict(fields))
             )
+            if self._metric_loki_enqueued:
+                self._metric_loki_enqueued.add(1)
         except Full:
             with self._loki_state_lock:
                 self._loki_dropped_events_count += 1
+            if self._metric_loki_dropped:
+                self._metric_loki_dropped.add(1)
             self._maybe_warn_dropped_events()
 
     def _loki_worker_loop(self) -> None:
@@ -1687,6 +1910,155 @@ class ObservabilityClient:
         if self.settings.enable_mlflow:
             mlflow.log_artifact(path)
 
+    @property
+    def metric_meter(self) -> Any:
+        """Return the active OpenTelemetry ``Meter``, or ``None`` if metrics off.
+
+        Exposed for power users that need instrument kinds not wrapped by the
+        :meth:`counter` / :meth:`histogram` / :meth:`up_down_counter` helpers
+        (for example observable gauges with custom callbacks).
+
+        Returns:
+            Any: The configured ``Meter`` instance, or ``None`` when metrics are
+            disabled or OpenTelemetry is unavailable.
+        """
+        return self._meter
+
+    def _get_or_create_instrument(
+        self,
+        kind: str,
+        name: str,
+        *,
+        unit: str,
+        description: str,
+    ) -> Any:
+        """Return a cached instrument, creating it on first use.
+
+        OpenTelemetry expects each named instrument to be created once per
+        meter; repeated creation logs a duplicate-instrument warning. This
+        caches by ``(kind, name)`` so callers can record by name on every call.
+
+        Args:
+            kind (str): Instrument kind (``"counter"``, ``"up_down_counter"``,
+                or ``"histogram"``).
+            name (str): Instrument name.
+            unit (str): Unit applied only when the instrument is first created.
+            description (str): Description applied only on first creation.
+
+        Returns:
+            Any: The instrument instance, or ``None`` when metrics are disabled.
+        """
+        if not self._meter:
+            return None
+        key = (kind, name)
+        instrument = self._user_instruments.get(key)
+        if instrument is not None:
+            return instrument
+        with self._user_instruments_lock:
+            instrument = self._user_instruments.get(key)
+            if instrument is not None:
+                return instrument
+            if kind == "counter":
+                instrument = self._meter.create_counter(
+                    name, unit=unit, description=description
+                )
+            elif kind == "up_down_counter":
+                instrument = self._meter.create_up_down_counter(
+                    name, unit=unit, description=description
+                )
+            elif kind == "histogram":
+                instrument = self._meter.create_histogram(
+                    name, unit=unit, description=description
+                )
+            else:  # pragma: no cover - guarded by callers
+                raise ValueError(f"Unknown instrument kind: {kind!r}")
+            self._user_instruments[key] = instrument
+            return instrument
+
+    def counter(
+        self,
+        name: str,
+        value: int | float = 1,
+        *,
+        unit: str = "",
+        description: str = "",
+        attributes: dict[str, Any] | None = None,
+    ) -> None:
+        """Add to a monotonic counter metric (silent no-op when metrics off).
+
+        The underlying instrument is created once on first use and reused on
+        subsequent calls with the same ``name``; ``unit`` and ``description``
+        only take effect on that first creation.
+
+        Args:
+            name (str): Counter name (for example ``"requests.total"``).
+            value (int | float, optional): Amount to add. Defaults to ``1``.
+            unit (str, optional): Unit, applied only on first creation.
+            description (str, optional): Description, applied on first creation.
+            attributes (dict[str, Any] | None, optional): Low-cardinality metric
+                attributes. Keep identifiers (request_id, UUIDs) out of these.
+        """
+        instrument = self._get_or_create_instrument(
+            "counter", name, unit=unit, description=description
+        )
+        if instrument is not None:
+            instrument.add(value, attributes or {})
+
+    def up_down_counter(
+        self,
+        name: str,
+        value: int | float,
+        *,
+        unit: str = "",
+        description: str = "",
+        attributes: dict[str, Any] | None = None,
+    ) -> None:
+        """Add to a non-monotonic up/down counter (silent no-op when metrics off).
+
+        Use for values that can increase and decrease, such as in-flight
+        requests or active connections.
+
+        Args:
+            name (str): Instrument name.
+            value (int | float): Signed amount to add (may be negative).
+            unit (str, optional): Unit, applied only on first creation.
+            description (str, optional): Description, applied on first creation.
+            attributes (dict[str, Any] | None, optional): Low-cardinality metric
+                attributes.
+        """
+        instrument = self._get_or_create_instrument(
+            "up_down_counter", name, unit=unit, description=description
+        )
+        if instrument is not None:
+            instrument.add(value, attributes or {})
+
+    def histogram(
+        self,
+        name: str,
+        value: int | float,
+        *,
+        unit: str = "",
+        description: str = "",
+        attributes: dict[str, Any] | None = None,
+    ) -> None:
+        """Record a value on a histogram metric (silent no-op when metrics off).
+
+        Use for distributions such as request latency or payload sizes.
+
+        Args:
+            name (str): Histogram name.
+            value (int | float): Value to record.
+            unit (str, optional): Unit, applied only on first creation.
+            description (str, optional): Description, applied on first creation.
+            attributes (dict[str, Any] | None, optional): Low-cardinality metric
+                attributes.
+        """
+        instrument = self._get_or_create_instrument(
+            "histogram", name, unit=unit, description=description
+        )
+        if instrument is not None:
+            instrument.record(value, attributes or {})
+
     @contextlib.contextmanager
     def span(self, name: str, **attributes: Any) -> Iterator[trace.Span | None]:
         """Create a tracing span with optional attributes.
@@ -1720,6 +2092,13 @@ class ObservabilityClient:
             return
         self._closed = True
         self._stop_loki_worker()
+        if self._meter_provider is not None:
+            # Only flush a provider this client installed; a reused process-global
+            # provider is owned by whoever created it.
+            try:
+                self._meter_provider.shutdown()
+            except Exception:  # noqa: BLE001 - shutdown must not raise on close
+                pass
         if self.settings.enable_mlflow and self._run_id:
             self.log_event("mlflow_run_closed", run_id=self._run_id)
             mlflow.end_run()

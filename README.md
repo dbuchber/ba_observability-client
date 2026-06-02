@@ -1,11 +1,11 @@
 # ba-observability-client
 
-Reusable Python observability client for structured logs, Loki push ingestion, OpenTelemetry tracing, and MLflow run tracking.
+Reusable Python observability client for structured logs, Loki push ingestion, OpenTelemetry tracing, OpenTelemetry metrics, and MLflow run tracking.
 
 This package is designed for:
 
 - **simple scripts** (quick logging with low setup),
-- **long-running services** (request spans + propagated context),
+- **long-running services** (request spans + propagated context + operational metrics),
 - **experiment workloads** (MLflow params/metrics/artifacts + logs/traces).
 
 ## Features
@@ -18,6 +18,10 @@ This package is designed for:
   - Manual span helpers: `span`, `fastapi_request_span` (inbound extraction),
     `httpx_request` / `inject_trace_headers` (outbound injection)
   - `trace_id` / `span_id` automatically added to every log event for log↔trace correlation
+- OpenTelemetry metrics, exported via OTLP/HTTP (e.g. to a Prometheus/Mimir backend):
+  - Business-metric API: `counter`, `histogram`, `up_down_counter` (+ `metric_meter` accessor)
+  - Built-in client self-metrics (Loki queue depth, dropped/failed events, request durations)
+  - Default on for `service` / `agent` (follows `enable_tracing`); silent no-op when disabled
 - MLflow integration:
   - `start_run`, `log_params`, `log_metrics`, `log_artifact`, `close`
 - Context binding for correlation (`bind`) across logs and traces
@@ -118,14 +122,15 @@ Configuration precedence is always:
 | Enable MLflow | `OBSERVABILITY_ENABLE_MLFLOW`, `ENABLE_MLFLOW` | Profile preset if unset |
 | Enable tracing | `OBSERVABILITY_ENABLE_TRACING`, `ENABLE_TRACING` | Profile preset if unset |
 | Enable auto-instrumentation | `OBSERVABILITY_AUTO_INSTRUMENTATION`, `ENABLE_AUTO_INSTRUMENTATION` | Follows resolved tracing if unset |
+| Enable metrics | `OBSERVABILITY_ENABLE_METRICS`, `ENABLE_METRICS` | Follows resolved tracing if unset |
 
 ### Profile presets
 
-- `script`: MLflow disabled, tracing disabled
-- `service`: MLflow enabled, tracing enabled
-- `agent`: MLflow enabled, tracing enabled
+- `script`: MLflow disabled, tracing disabled (metrics follow tracing → disabled)
+- `service`: MLflow enabled, tracing enabled (metrics follow tracing → enabled)
+- `agent`: MLflow enabled, tracing enabled (metrics follow tracing → enabled)
 
-You can still override either toggle explicitly.
+You can still override any toggle explicitly.
 
 ## Usage Patterns
 
@@ -249,6 +254,54 @@ When MLflow is enabled:
 
 If MLflow is disabled (e.g., script profile), calling `start_run` raises a `RuntimeError`.
 
+## Metrics Integration
+
+OpenTelemetry metrics cover **operational** signals (request rates, latency
+distributions, queue health) for dashboards and alerts. This is distinct from
+MLflow's `log_metrics`, which tracks **experiment** metrics per run — the two
+answer different questions and do not overlap.
+
+Metrics export via OTLP/HTTP to `<OTEL_EXPORTER_OTLP_ENDPOINT>/v1/metrics`
+(same base endpoint as traces, e.g. through Alloy to a Prometheus/Mimir
+backend). No extra dependency is required — `opentelemetry-exporter-otlp`
+already bundles the metric exporter. `enable_metrics` follows `enable_tracing`
+by default (off for `script`, on for `service` / `agent`).
+
+### Business metrics
+
+```python
+client.counter("requests.total", attributes={"route": "/search"})
+client.histogram("search.latency_ms", 42.0, unit="ms", attributes={"route": "/search"})
+client.up_down_counter("requests.in_flight", 1)   # and -1 when done
+
+# Package-level shortcuts through the default client:
+from observability_client import counter, histogram
+counter("requests.total", route="/search")
+histogram("search.latency_ms", 42.0)
+```
+
+Instruments are created once on first use and cached by `(kind, name)`; later
+calls with the same name reuse them. All metric methods are **silent no-ops**
+when metrics are disabled, so they're safe to leave in code paths that run under
+the `script` profile too. For instrument kinds not wrapped here (e.g. observable
+gauges with custom callbacks), use the `metric_meter` accessor, which returns the
+active `Meter` or `None`.
+
+Keep metric **attributes** low-cardinality (the same rule as Loki labels):
+method and route are fine; full URLs, `request_id`s, and UUIDs are not.
+
+### Built-in self-metrics
+
+When metrics are enabled the client emits its own instruments describing
+delivery health and request timing:
+
+- `observability.loki.events_enqueued` (counter)
+- `observability.loki.events_dropped` (counter)
+- `observability.loki.delivery_failures` (counter)
+- `observability.loki.queue_depth` (observable gauge)
+- `observability.http.server.duration` (histogram, ms) — from `fastapi_request_span`
+- `observability.http.client.duration` (histogram, ms) — from `httpx_request`
+
 ## Loki Push Logging Contract
 
 Default endpoint:
@@ -278,6 +331,11 @@ chronic problems stay visible without flooding stdout):
   was already installed (by another client, by `opentelemetry-distro`
   auto-init, etc.); the client reuses it instead of clobbering the global.
 - `tracing_dependency_missing` — `enable_tracing=True` was requested but the
+  OpenTelemetry packages are not installed; structured logging continues
+  unaffected.
+- `meter_provider_already_installed` — another OpenTelemetry `MeterProvider`
+  was already installed; the client reuses it instead of clobbering the global.
+- `metrics_dependency_missing` — `enable_metrics=True` was requested but the
   OpenTelemetry packages are not installed; structured logging continues
   unaffected.
 
@@ -313,12 +371,14 @@ Primary exports (`observability_client`):
 - `get_default_client(...)`
 - `reset_default_client()`
 - `log_event(...)`, `log_info(...)`, `log_warning(...)`, `log_error(...)`
+- `counter(...)`, `histogram(...)`
 
 Key `ObservabilityClient` methods:
 
 - Logging: `log_event`, `log_sparql`, `bind`
 - Tracing: `span`, `fastapi_request_span`, `httpx_request`, `inject_trace_headers`,
   `instrument_fastapi` (activate FastAPI auto-instrumentation on an app)
+- Metrics: `counter`, `histogram`, `up_down_counter`, `metric_meter`
 - MLflow: `start_run`, `log_params`, `log_metrics`, `log_artifact`
 - Construction: `from_env`, `quick_script_mode`, `full_mode`
 - Lifecycle: `close`
@@ -339,5 +399,11 @@ Key `ObservabilityClient` methods:
     suppress this automatically; if you see duplicates, check that you are not
     running both `opentelemetry-instrument` (the launcher) *and* this client's
     auto-instrumentation.
+- **No metrics visible**
+  - Verify metrics are enabled (`enable_metrics` / `OBSERVABILITY_ENABLE_METRICS`;
+    they follow `enable_tracing` by default, so `script` has them off).
+  - The OTLP endpoint must accept metrics at `<base>/v1/metrics` (HTTP, port 4318).
+  - Metrics export on a periodic interval and on `close()` — call `close()` for
+    short-lived scripts so the final batch is flushed.
 - **No Loki logs arriving**
   - Check push endpoint path includes `/loki/api/v1/push` and that your receiver is reachable.

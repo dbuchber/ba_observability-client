@@ -105,6 +105,33 @@ def log_error(message: str, **fields: Any) -> None:
     """
     log_event(message, level="error", **fields)
 
+
+def counter(name: str, value: int | float = 1, **attributes: Any) -> None:
+    """Add to a counter metric through the default client.
+
+    Silent no-op when metrics are disabled on the default client.
+
+    Args:
+        name (str): Counter name.
+        value (int | float, optional): Amount to add. Defaults to ``1``.
+        **attributes (Any): Low-cardinality metric attributes.
+    """
+    get_default_client().counter(name, value, attributes=attributes or None)
+
+
+def histogram(name: str, value: int | float, **attributes: Any) -> None:
+    """Record a value on a histogram metric through the default client.
+
+    Silent no-op when metrics are disabled on the default client.
+
+    Args:
+        name (str): Histogram name.
+        value (int | float): Value to record.
+        **attributes (Any): Low-cardinality metric attributes.
+    """
+    get_default_client().histogram(name, value, attributes=attributes or None)
+
+
 TelemetryClient = ObservabilityClient
 
 __all__ = [
@@ -117,4 +144,6 @@ __all__ = [
     "log_info",
     "log_warning",
     "log_error",
+    "counter",
+    "histogram",
 ]
