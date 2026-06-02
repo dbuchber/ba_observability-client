@@ -1583,13 +1583,16 @@ class ObservabilityClient:
         Raises:
             RuntimeError: If delivery fails and ``raise_on_error`` is true.
         """
-        req = request.Request(
-            endpoint,
-            data=json.dumps(body).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
         try:
+            # request.Request() parses the URL in its constructor and raises
+            # ValueError for an unknown scheme (e.g. "not-a-url"), so it must be
+            # inside the try to be caught alongside urlopen failures.
+            req = request.Request(
+                endpoint,
+                data=json.dumps(body).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
             with request.urlopen(req, timeout=self._LOKI_REQUEST_TIMEOUT_SECONDS):
                 return True
         except (error.URLError, TimeoutError, OSError, ValueError) as exc:

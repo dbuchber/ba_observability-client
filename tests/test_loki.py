@@ -186,6 +186,34 @@ class TestAsyncWorker:
         assert payload["message"] == "will-succeed"
 
 
+class TestPostLokiBodyUrlErrors:
+    """Real ``_post_loki_body`` path (no mock): malformed URLs must be caught.
+
+    ``request.Request()`` parses the URL in its constructor and raises
+    ``ValueError`` for an unknown scheme (e.g. ``"not-a-url"``) before any
+    network call. These tests exercise the unmocked method to guard against
+    that ``ValueError`` escaping the ``try`` block.
+    """
+
+    @pytest.mark.parametrize("endpoint", ["not-a-url", "unknownscheme://host/push"])
+    def test_async_mode_returns_false_for_bad_url(self, make_client, endpoint) -> None:
+        client = make_client(loki_push_endpoint=endpoint)
+
+        # Must return False, not raise, even when the URL is unparsable.
+        result = client._push_log_sync(
+            message="m", level="info", fields={}, raise_on_error=False
+        )
+        assert result is False
+
+    def test_strict_mode_wraps_bad_url_in_runtime_error(self, make_client) -> None:
+        client = make_client(loki_push_endpoint="not-a-url")
+
+        with pytest.raises(RuntimeError, match="Failed to push log"):
+            client._push_log_sync(
+                message="m", level="info", fields={}, raise_on_error=True
+            )
+
+
 class TestDeliveryFailureCounter:
     def test_failure_count_increments_per_failed_delivery(
         self, make_client, loki_capture
