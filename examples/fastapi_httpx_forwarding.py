@@ -1,7 +1,14 @@
 """FastAPI forwarding example with httpx trace propagation.
 
-This example demonstrates inbound extraction via ``fastapi_request_span`` and
-outbound injection via ``httpx_request``.
+This example demonstrates the recommended setup for a ``service`` profile:
+OpenTelemetry auto-instrumentation creates the inbound (FastAPI) and outbound
+(httpx) spans, while ``fastapi_request_span`` / ``httpx_request`` keep the
+``request_id`` ↔ log correlation. With auto-instrumentation enabled (the default
+here), those helpers enrich the instrumentor's span instead of creating their
+own — so there are no duplicate spans.
+
+Set ``OTEL_EXPORTER_OTLP_ENDPOINT`` to your Tempo/OTLP HTTP receiver (port 4318)
+to export the resulting traces.
 """
 
 from __future__ import annotations
@@ -29,6 +36,10 @@ client = ObservabilityClient(
     enable_mlflow=False,
     enable_tracing=True,
 )
+# Activate FastAPI auto-instrumentation (httpx is auto-instrumented on
+# construction). Inbound requests now get a SERVER span from the instrumentor;
+# fastapi_request_span only enriches it with request_id.
+client.instrument_fastapi(app)
 
 
 @app.get("/downstream")

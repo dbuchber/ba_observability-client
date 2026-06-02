@@ -61,6 +61,22 @@ except ImportError:  # pragma: no cover
     DEPLOYMENT_ENVIRONMENT = "deployment.environment"
     SERVICE_NAME = "service.name"
 
+try:
+    from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+
+    _HTTPX_INSTRUMENTOR_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    HTTPXClientInstrumentor = None
+    _HTTPX_INSTRUMENTOR_AVAILABLE = False
+
+try:
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+    _FASTAPI_INSTRUMENTOR_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    FastAPIInstrumentor = None
+    _FASTAPI_INSTRUMENTOR_AVAILABLE = False
+
 
 def git_commit() -> str:
     """Return the current git commit hash if available.
@@ -110,6 +126,9 @@ class ObservabilitySettings:
         loki_job (str): Stable Loki label used as broad source type.
         enable_mlflow (bool): Whether MLflow features are enabled.
         enable_tracing (bool): Whether OpenTelemetry tracing is enabled.
+        enable_auto_instrumentation (bool): Whether OpenTelemetry
+            auto-instrumentation (httpx outbound, FastAPI inbound) is activated
+            when tracing is enabled. Defaults to follow ``enable_tracing``.
     """
 
     service_name: str
@@ -122,6 +141,7 @@ class ObservabilitySettings:
     loki_job: str
     enable_mlflow: bool
     enable_tracing: bool
+    enable_auto_instrumentation: bool
 
 
 @dataclass(frozen=True)
@@ -361,6 +381,7 @@ class ObservabilityClient:
         loki_job: str = "host-python",
         enable_mlflow: bool | None = None,
         enable_tracing: bool | None = None,
+        enable_auto_instrumentation: bool | None = None,
     ) -> None:
         """Initialize the observability client.
 
@@ -387,6 +408,11 @@ class ObservabilityClient:
                 If ``None``, profile preset value is used.
             enable_tracing (bool | None, optional): Explicit tracing override.
                 If ``None``, profile preset value is used.
+            enable_auto_instrumentation (bool | None, optional): Explicit
+                override for OpenTelemetry auto-instrumentation. If ``None``,
+                it follows the resolved ``enable_tracing`` value (on for
+                service/agent, off for script). Has no effect when tracing is
+                disabled or OpenTelemetry is unavailable.
 
         Raises:
             ValueError: If required values are empty or profile is invalid.
@@ -398,6 +424,11 @@ class ObservabilityClient:
             profile=normalized_profile,
             enable_mlflow=enable_mlflow,
             enable_tracing=enable_tracing,
+        )
+        resolved_enable_auto_instrumentation = (
+            resolved_enable_tracing
+            if enable_auto_instrumentation is None
+            else enable_auto_instrumentation
         )
 
         self.settings = ObservabilitySettings(
@@ -414,6 +445,7 @@ class ObservabilityClient:
             loki_job=loki_job,
             enable_mlflow=resolved_enable_mlflow,
             enable_tracing=resolved_enable_tracing,
+            enable_auto_instrumentation=resolved_enable_auto_instrumentation,
         )
         if self.settings.enable_mlflow and mlflow is None:
             raise RuntimeError(
@@ -440,6 +472,10 @@ class ObservabilityClient:
             if self.settings.enable_tracing and _OTEL_AVAILABLE
             else None
         )
+        self._httpx_auto_instrumented = False
+        self._fastapi_auto_instrumented = False
+        if self._tracer and self.settings.enable_auto_instrumentation:
+            self._configure_auto_instrumentation()
         self._loki_queue: Queue[_LokiQueueItem] = Queue(maxsize=self._LOKI_QUEUE_MAXSIZE)
         self._loki_worker_stop = threading.Event()
         self._loki_worker_thread: threading.Thread | None = None
@@ -582,6 +618,7 @@ class ObservabilityClient:
         loki_job: str | None = None,
         enable_mlflow: bool | None = None,
         enable_tracing: bool | None = None,
+        enable_auto_instrumentation: bool | None = None,
     ) -> "ObservabilityClient":
         """Create a client from environment variables.
 
@@ -599,6 +636,10 @@ class ObservabilityClient:
             loki_job (str | None, optional): Loki job override.
             enable_mlflow (bool | None, optional): MLflow override.
             enable_tracing (bool | None, optional): Tracing override.
+            enable_auto_instrumentation (bool | None, optional): Override for
+                auto-instrumentation. Falls back to
+                ``OBSERVABILITY_AUTO_INSTRUMENTATION`` and then the resolved
+                tracing value.
 
         Returns:
             ObservabilityClient: Configured client instance.
@@ -687,6 +728,15 @@ class ObservabilityClient:
                 )
             )
 
+        resolved_enable_auto_instrumentation = enable_auto_instrumentation
+        if resolved_enable_auto_instrumentation is None:
+            resolved_enable_auto_instrumentation = cls._parse_bool(
+                cls._first_non_empty(
+                    os.getenv("OBSERVABILITY_AUTO_INSTRUMENTATION"),
+                    os.getenv("ENABLE_AUTO_INSTRUMENTATION"),
+                )
+            )
+
         if resolved_service_name is None:
             raise ValueError(
                 "service_name is required. Pass service_name or set "
@@ -706,6 +756,7 @@ class ObservabilityClient:
             loki_job=resolved_loki_job,
             enable_mlflow=resolved_enable_mlflow,
             enable_tracing=resolved_enable_tracing,
+            enable_auto_instrumentation=resolved_enable_auto_instrumentation,
         )
 
     @classmethod
@@ -855,6 +906,96 @@ class ObservabilityClient:
         provider.add_span_processor(BatchSpanProcessor(exporter))
         trace.set_tracer_provider(provider)
         return trace.get_tracer(self.settings.service_name)
+
+    def _configure_auto_instrumentation(self) -> None:
+        """Activate OpenTelemetry auto-instrumentation for outbound httpx calls.
+
+        Runs once during ``__init__`` when tracing is active and
+        ``enable_auto_instrumentation`` is set. Instruments ``httpx`` globally
+        so every client request produces a span and propagates W3C context
+        without needing an explicit :meth:`httpx_request` wrapper. The
+        instrumentor binds to the process-global ``TracerProvider`` configured
+        by :meth:`_configure_tracer`.
+
+        FastAPI cannot be instrumented here because it needs the application
+        instance; call :meth:`instrument_fastapi` for that.
+
+        Missing instrumentor packages are logged and skipped, never raised —
+        structured logging and manual spans keep working.
+        """
+        if not _HTTPX_INSTRUMENTOR_AVAILABLE:
+            self.log_event(
+                "auto_instrumentation_dependency_missing",
+                level="warning",
+                component="httpx",
+                note=(
+                    "opentelemetry-instrumentation-httpx is not installed; "
+                    "outbound httpx spans fall back to the httpx_request helper."
+                ),
+            )
+            return
+
+        instrumentor = HTTPXClientInstrumentor()
+        if not instrumentor.is_instrumented_by_opentelemetry:
+            instrumentor.instrument()
+        self._httpx_auto_instrumented = True
+        self.log_event("httpx_auto_instrumented", component="httpx")
+
+    @staticmethod
+    def _httpx_globally_instrumented() -> bool:
+        """Return whether httpx is currently auto-instrumented in this process.
+
+        The httpx instrumentor is a process-global singleton, so any client (or
+        the host application) activating it patches httpx for everyone. The
+        :meth:`httpx_request` double-span guard keys off this live state rather
+        than a per-instance flag, so it also defers correctly when something
+        other than this client installed the instrumentation.
+
+        Returns:
+            bool: ``True`` if httpx is auto-instrumented, else ``False``.
+        """
+        return bool(
+            _HTTPX_INSTRUMENTOR_AVAILABLE
+            and HTTPXClientInstrumentor().is_instrumented_by_opentelemetry
+        )
+
+    def instrument_fastapi(self, app: Any) -> Any:
+        """Instrument a FastAPI application for automatic server-side spans.
+
+        Installs OpenTelemetry's FastAPI middleware on ``app`` using the
+        process-global tracer provider configured by this client, so inbound
+        requests produce SERVER spans and extract W3C trace context
+        automatically — no per-route :meth:`fastapi_request_span` wrapper
+        needed. Once instrumented, ``fastapi_request_span`` stops creating its
+        own span and only enriches the active span with ``request_id``.
+
+        No-op (with a warning) when tracing or auto-instrumentation is disabled,
+        or when the FastAPI instrumentor package is not installed.
+
+        Args:
+            app (Any): FastAPI application instance.
+
+        Returns:
+            Any: The same ``app`` instance, for chaining.
+        """
+        if not self._tracer or not self.settings.enable_auto_instrumentation:
+            return app
+        if not _FASTAPI_INSTRUMENTOR_AVAILABLE:
+            self.log_event(
+                "auto_instrumentation_dependency_missing",
+                level="warning",
+                component="fastapi",
+                note=(
+                    "opentelemetry-instrumentation-fastapi is not installed; "
+                    "inbound spans fall back to the fastapi_request_span helper."
+                ),
+            )
+            return app
+
+        FastAPIInstrumentor.instrument_app(app)
+        self._fastapi_auto_instrumented = True
+        self.log_event("fastapi_auto_instrumented", component="fastapi")
+        return app
 
     def _to_unix_ns_timestamp(self) -> str:
         """Return the current UTC time as a Unix nanoseconds string.
@@ -1063,6 +1204,17 @@ class ObservabilityClient:
                 yield resolved_request_id
                 return
 
+            if self._fastapi_auto_instrumented:
+                # The FastAPI instrumentor already started the SERVER span and
+                # extracted W3C context. Don't open a duplicate; just enrich the
+                # active span with request_id and any extra attributes.
+                current_span = trace.get_current_span()
+                for key, value in span_attributes.items():
+                    if value is not None:
+                        current_span.set_attribute(key, value)
+                yield resolved_request_id
+                return
+
             with self._tracer.start_as_current_span(
                 span_name,
                 context=extracted_context,
@@ -1125,6 +1277,13 @@ class ObservabilityClient:
         normalized_keys = {str(key).lower() for key in outgoing_headers}
         if bound_request_id and header_key.lower() not in normalized_keys:
             outgoing_headers[header_key] = str(bound_request_id)
+
+        if self._httpx_globally_instrumented():
+            # Whenever httpx is auto-instrumented in this process (by this
+            # client or anyone else), the instrumentor owns the CLIENT span and
+            # W3C propagation. Avoid a duplicate manual span; only forward the
+            # business request_id header set above.
+            return request_func(method, url, headers=outgoing_headers, **kwargs)
 
         if not self._tracer:
             outgoing_headers = self.inject_trace_headers(outgoing_headers)

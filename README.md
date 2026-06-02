@@ -12,9 +12,12 @@ This package is designed for:
 
 - Structured JSON logging (`log_event`, `log_sparql`)
 - Asynchronous Loki push delivery (`log_event(..., push=True)`) with optional strict sync mode
-- OpenTelemetry spans (`span`) and HTTP propagation helpers:
-  - `fastapi_request_span` (inbound extraction)
-  - `httpx_request` / `inject_trace_headers` (outbound injection)
+- OpenTelemetry tracing, exported via OTLP/HTTP (e.g. to Tempo):
+  - Auto-instrumentation for outbound `httpx` and inbound FastAPI (default on for
+    `service` / `agent`) — see `instrument_fastapi`
+  - Manual span helpers: `span`, `fastapi_request_span` (inbound extraction),
+    `httpx_request` / `inject_trace_headers` (outbound injection)
+  - `trace_id` / `span_id` automatically added to every log event for log↔trace correlation
 - MLflow integration:
   - `start_run`, `log_params`, `log_metrics`, `log_artifact`, `close`
 - Context binding for correlation (`bind`) across logs and traces
@@ -32,8 +35,13 @@ Core dependencies (from `pyproject.toml`):
 - `mlflow>=3.11.1`
 - `opentelemetry-distro>=0.62b1`
 - `opentelemetry-exporter-otlp>=1.41.1`
+- `opentelemetry-instrumentation-httpx==0.62b1`
+- `opentelemetry-instrumentation-fastapi==0.62b1`
 
-Some examples use additional packages (`fastapi`, `prometheus-client`, `uvicorn`).
+The two `opentelemetry-instrumentation-*` packages are pinned to match the
+distro version and power the auto-instrumentation described under
+[Tracing Integration](#tracing-integration). Some examples use additional
+packages (`fastapi`, `prometheus-client`, `uvicorn`).
 
 ## Installation
 
@@ -109,6 +117,7 @@ Configuration precedence is always:
 | Loki job label | `OBSERVABILITY_LOKI_JOB`, `LOKI_JOB` | `host-python` |
 | Enable MLflow | `OBSERVABILITY_ENABLE_MLFLOW`, `ENABLE_MLFLOW` | Profile preset if unset |
 | Enable tracing | `OBSERVABILITY_ENABLE_TRACING`, `ENABLE_TRACING` | Profile preset if unset |
+| Enable auto-instrumentation | `OBSERVABILITY_AUTO_INSTRUMENTATION`, `ENABLE_AUTO_INSTRUMENTATION` | Follows resolved tracing if unset |
 
 ### Profile presets
 
@@ -151,6 +160,54 @@ client.close()
 
 ## Tracing Integration
 
+Traces are exported via OTLP/HTTP to `{otlp_endpoint}/v1/traces` (default
+`http://localhost:4318`, i.e. a Tempo/OTLP-collector HTTP receiver on port
+**4318** — not the gRPC port 4317). Every log event also carries `trace_id` /
+`span_id` of the active span, so logs and traces correlate in Grafana via a
+`trace_id` derived field (Loki → Tempo).
+
+### Auto-instrumentation (recommended for services)
+
+For `service` / `agent` profiles, OpenTelemetry auto-instrumentation is enabled
+by default (`enable_auto_instrumentation`, follows `enable_tracing`). This means:
+
+- **Outbound `httpx`** is instrumented globally on construction — every request
+  gets a CLIENT span and W3C `traceparent` propagation, with or without the
+  `httpx_request` helper.
+- **Inbound FastAPI** is instrumented per-app — call `client.instrument_fastapi(app)`
+  once after creating the app:
+
+  ```python
+  app = FastAPI()
+  client.instrument_fastapi(app)   # installs the OTel SERVER-span middleware
+  ```
+
+When auto-instrumentation is active, the manual helpers
+(`httpx_request`, `fastapi_request_span`) **stop creating their own spans** to
+avoid duplicates — they only forward / bind the business `request_id` onto the
+instrumentor's span. So you keep the `request_id` ↔ log coupling while the
+instrumentor owns span creation and propagation.
+
+Disable per client with `enable_auto_instrumentation=False` (or env
+`OBSERVABILITY_AUTO_INSTRUMENTATION=0`) to fall back to manual-only spans.
+
+> Requires `opentelemetry-instrumentation-httpx` / `-fastapi` (declared deps). If
+> missing, the client logs `auto_instrumentation_dependency_missing` and the
+> manual helpers create the spans instead — it never raises.
+
+### Distributed setup (traces across nodes)
+
+A single Tempo collects spans from all nodes; traces join via the W3C
+`traceparent` header that propagates over inter-service HTTP calls. Point every
+node at the same Tempo:
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://<tempo-host>:4318
+```
+
+If a node cannot reach Tempo directly (e.g. behind NAT/SSH), forward the OTLP
+port through your tunnel and point the node at `http://localhost:4318`.
+
 ### FastAPI inbound + outbound `httpx` forwarding
 
 ```python
@@ -158,9 +215,13 @@ from fastapi import FastAPI, Request
 import httpx
 
 app = FastAPI()
+client.instrument_fastapi(app)   # SERVER spans created automatically (auto-instrumentation)
 
 @app.get("/proxy")
 def proxy(request: Request):
+    # With auto-instrumentation on, fastapi_request_span / httpx_request do NOT
+    # create their own spans — they only resolve/forward request_id and enrich
+    # the instrumentor's span. The pattern below stays the same either way.
     with client.fastapi_request_span(request=request, span_name="proxy.handle") as request_id:
         scoped = client.bind(request_id=request_id)
         with httpx.Client(timeout=3.0) as http_client:
@@ -171,6 +232,10 @@ def proxy(request: Request):
             )
         return response.json()
 ```
+
+If you disable auto-instrumentation (`enable_auto_instrumentation=False`), the
+exact same code path keeps working — the helpers then create the spans
+themselves.
 
 ## MLflow Integration
 
@@ -249,6 +314,15 @@ Primary exports (`observability_client`):
 - `reset_default_client()`
 - `log_event(...)`, `log_info(...)`, `log_warning(...)`, `log_error(...)`
 
+Key `ObservabilityClient` methods:
+
+- Logging: `log_event`, `log_sparql`, `bind`
+- Tracing: `span`, `fastapi_request_span`, `httpx_request`, `inject_trace_headers`,
+  `instrument_fastapi` (activate FastAPI auto-instrumentation on an app)
+- MLflow: `start_run`, `log_params`, `log_metrics`, `log_artifact`
+- Construction: `from_env`, `quick_script_mode`, `full_mode`
+- Lifecycle: `close`
+
 ## Troubleshooting
 
 - **`ValueError` for missing `service_name` / `env`**
@@ -256,6 +330,14 @@ Primary exports (`observability_client`):
 - **MLflow runtime errors**
   - Ensure MLflow is installed and enabled for your chosen profile.
 - **No traces visible**
-  - Verify OTEL dependencies and endpoint (`OTEL_EXPORTER_OTLP_ENDPOINT`).
+  - Verify OTEL dependencies and endpoint (`OTEL_EXPORTER_OTLP_ENDPOINT`); the
+    endpoint must point at an OTLP **HTTP** receiver (port 4318, not 4317).
+  - For inbound FastAPI spans with auto-instrumentation, ensure you called
+    `client.instrument_fastapi(app)`.
+- **Duplicate spans for the same request**
+  - You are creating manual spans on top of auto-instrumentation. The helpers
+    suppress this automatically; if you see duplicates, check that you are not
+    running both `opentelemetry-instrument` (the launcher) *and* this client's
+    auto-instrumentation.
 - **No Loki logs arriving**
   - Check push endpoint path includes `/loki/api/v1/push` and that your receiver is reachable.
