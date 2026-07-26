@@ -1,5 +1,7 @@
 # ba-observability-client
 
+> **Part of the [BA knowledge-graph pipeline](../CLAUDE.md).** Cross-repo context, host layout, and the service map live in the `ba_meta` overlay repo at [`../CLAUDE.md`](../CLAUDE.md).
+
 Reusable Python observability client for structured logs, Loki push ingestion, OpenTelemetry tracing, OpenTelemetry metrics, and MLflow run tracking.
 
 This package is designed for:
