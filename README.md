@@ -30,6 +30,9 @@ This package is designed for:
 - Shared default-client convenience helpers:
   - `get_default_client`, `reset_default_client`
   - `log_event`, `log_info`, `log_warning`, `log_error`
+- Chat notifications **without credentials** (`observability_client.notify`):
+  compose lifecycle messages, relay them through Loki + Grafana alerting — see
+  [Notifications without credentials](#notifications-without-credentials)
 
 ## Requirements
 
@@ -345,6 +348,53 @@ Label guidance:
 
 - Keep labels low-cardinality (`job`, `service`, `env`, `level`)
 - Put high-cardinality identifiers (`request_id`, UUIDs, query hashes) in JSON fields, not labels
+
+## Notifications without credentials
+
+`observability_client.notify` composes lifecycle messages ("job started",
+"50 % done", "job failed") and hands them to Loki as a `manual_notify` event
+carrying the finished text in `notify_text`. A Grafana alert rule turns each
+distinct text into an alert instance and renders it verbatim to a contact point.
+
+**Grafana is the transport, not the author** — which is the whole point: this
+module holds no bot token, no chat id and calls no chat API. A repo that vendors
+this package gains notifications without gaining a secret, and muting or
+re-routing is a Grafana config change rather than a code change.
+
+```python
+from observability_client import ObservabilityClient
+from observability_client import notify
+
+obs = ObservabilityClient.quick_script_mode(service_name="kg-converter")
+notify.set_relay(obs)
+
+notify.send(notify.compose("▶ BUILD GESTARTET", [
+    ("Dump", "wikidata-20260128-truthy-BETA.nt.gz"),
+    ("Stages", "filter → reconnect → expand"),
+]))
+```
+
+Contract on the receiving side: the alert rule selects `{job="host-python"}` and
+groups by `(notify_text, service)`. Every consumer of this client therefore
+lands in it as long as it does not override `LOKI_JOB`, and `service_name` is
+what keeps senders apart. Because grouping is by *text*, two byte-identical
+messages would collapse into one alert instance and the second would never
+arrive — `compose` appends `stamp()` to every message to prevent exactly that.
+
+| Function | Purpose |
+|---|---|
+| `set_relay(obs)` | Register the client that pushes to Loki. Without it there is no route. |
+| `set_direct_sender(fn)` | Optional credentialed fallback for the one message that must survive a broken Loki path (typically "the job died"). The secret stays in the consumer. |
+| `enabled()` / `enabled_for(units)` | Route registered and not switched off; the second also applies a size threshold so smoke runs stay quiet. |
+| `send(text, direct=False)` | Deliver. Returns success, **never raises**. |
+| `compose(title, fields, blocks=)` | One message: title, labelled fields (empty ones dropped), blocks, timestamp last. |
+| `config_block(params, groups=, labels=, …)` | A flat parameter dict as a grouped table. The vocabulary is the caller's. |
+| `human_duration()` / `clock_time()` | Phone-readable durations, and the absolute time an ETA points at. |
+
+Environment: `NOTIFY_ENABLED=0` silences everything; `NOTIFY_MIN_UNITS` sets the
+`enabled_for` threshold. Messages are plain text on purpose — service and file
+names are full of underscores, which Telegram's Markdown parser rejects as
+unclosed entities before dropping the message entirely.
 
 ## Example Scripts
 
