@@ -179,6 +179,7 @@ def send(text: str, *, direct: bool = False) -> bool:
     return False
 
 
+#!node _send_via_relay
 def _send_via_relay(text: str) -> bool:
     """Push the finished message to Loki for the Grafana relay rule to pick up."""
     try:

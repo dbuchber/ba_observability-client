@@ -354,6 +354,7 @@ class BoundObservabilityClient:
         return _wrapped
 
 
+#!node ObservabilityClient
 class ObservabilityClient:
     """Provide one reusable API for logs, traces, MLflow, and Loki push.
 
